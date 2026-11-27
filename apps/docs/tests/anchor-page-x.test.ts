@@ -9,16 +9,28 @@ import { parseDocx } from '@genoffice/docx-engine'
 import { describe, expect, it } from 'vitest'
 import { buildDocx } from '../../../packages/docx-engine/tests/helpers/build-docx'
 import { blocksToPmDoc } from '../src/renderer/editor/convert'
-import { DocInlineImage, editorExtensions } from '../src/renderer/editor/extensions'
+import {
+  DocInlineImage,
+  editorExtensions,
+  shiftedOffsetCss,
+} from '../src/renderer/editor/extensions'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const css = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), '../src/renderer/styles.css'),
+  'utf8',
+)
 
 const PIC =
   '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
   '<pic:pic><pic:blipFill><a:blip r:embed="rId10"/></pic:blipFill>' +
   '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="6700000" cy="2540000"/></a:xfrm></pic:spPr></pic:pic></a:graphicData></a:graphic>'
 
-const anchor = (positionH: string, positionV: string, wrap: string) =>
+const anchor = (positionH: string, positionV: string, wrap: string, layoutInCell = '1') =>
   '<w:r><w:drawing>' +
-  '<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="251658240" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">' +
+  `<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="251658240" behindDoc="1" locked="0" layoutInCell="${layoutInCell}" allowOverlap="1">` +
   '<wp:simplePos x="0" y="0"/>' +
   positionH +
   positionV +
@@ -92,14 +104,17 @@ describe('page-relative anchor x', () => {
   // a full-page cover picture (behindDoc, wrapNone, page 0/0) sharing the cover's
   // first paragraph used to land one left margin to the right: its left band then
   // covered the kicker's first letters
+  const PAGE_ORIGIN = 'calc(var(--doc-margin-left,0px) + var(--doc-col-undo,0px))'
+  const ORIGIN = `var(--doc-img-cell-origin, ${PAGE_ORIGIN})`
+
   it('a run-level behind-text picture measures x from the paper edge', async () => {
     const style = await runImageStyle(
       `<w:p><w:r><w:t>Kicker</w:t></w:r>${anchor(PAGE_H, PAGE_V, '<wp:wrapNone/>')}</w:p>`,
     )
-    // 444500 EMU = 46.7px from the paper edge; the margin comes off in CSS, the
+    // 444500 EMU = 46.7px from the paper edge; the origin comes off in CSS, the
     // negative part in left and the positive part in the transform
-    expect(style).toContain('left:min(0px, calc(46.7px - var(--doc-margin-left,0px)))')
-    expect(style).toContain('translate(max(0px, calc(46.7px - var(--doc-margin-left,0px))), ')
+    expect(style).toContain(`left:min(0px, calc(46.7px - ${ORIGIN}))`)
+    expect(style).toContain(`translate(max(0px, calc(46.7px - ${ORIGIN})), `)
   })
 
   it('a column-relative behind-text run picture keeps its column x', async () => {
@@ -113,7 +128,46 @@ describe('page-relative anchor x', () => {
   it('a behind-text picture alone in its paragraph measures x from the paper edge', async () => {
     const dom = await render(`<w:p>${anchor(PAGE_H, PAGE_V, '<wp:wrapNone/>')}</w:p>`)
     const wrap = dom.querySelector<HTMLElement>('.doc-img-float .doc-img-wrap')!
-    expect(wrap.style.left).toBe('calc(46.7px - var(--doc-margin-left,0px))')
+    // (the CSSOM re-spaces the declaration)
+    const squeeze = (v: string) => v.replace(/\s+/g, '')
+    expect(squeeze(wrap.style.left)).toBe(squeeze(`calc(46.7px - ${ORIGIN})`))
+  })
+
+  describe('in a table cell', () => {
+    const cell = (run: string) =>
+      '<w:tbl><w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid><w:tr><w:tc>' +
+      `<w:p><w:r><w:t>Cell</w:t></w:r>${run}</w:p></w:tc></w:tr></w:tbl><w:p/>`
+
+    it('a layoutInCell picture positions from the cell, not from the paper edge', async () => {
+      const dom = await render(cell(anchor(PAGE_H, PARA_V, '<wp:wrapNone/>')))
+      const img = dom.querySelector<HTMLElement>('td img.doc-inline-img')!
+      // the cell zeroes the origin, so the offset measures from the cell
+      expect(img.getAttribute('style')).toContain(`calc(46.7px - ${ORIGIN})`)
+      expect(css).toMatch(/\n\.doc-page :is\(td, th\) \{\s*--doc-img-cell-origin: 0px;\s*\}/)
+    })
+
+    it('a layoutInCell="0" picture keeps the paper-edge origin', async () => {
+      const dom = await render(cell(anchor(PAGE_H, PARA_V, '<wp:wrapNone/>', '0')))
+      const img = dom.querySelector<HTMLElement>('td img.doc-inline-img')!
+      expect(img.getAttribute('style')).toContain(`calc(46.7px - ${PAGE_ORIGIN})`)
+      expect(img.getAttribute('style')).not.toContain('--doc-img-cell-origin')
+    })
+  })
+
+  it('undoes the column shift of a translated block, like page-relative boxes', () => {
+    expect(css).toMatch(
+      /\n\.editor-scroll \.doc-page:not\(\.measuring-columns\) \.doc-col-block \{\s*--doc-col-undo: var\(--col-dx, 0px\);\s*\}/,
+    )
+  })
+
+  it('the resize preview moves a calc() offset with the handle', () => {
+    expect(shiftedOffsetCss('12.5px', -4)).toBe('8.5px')
+    expect(shiftedOffsetCss(`calc(46.7px - ${ORIGIN})`, 10)).toBe(
+      `calc(calc(46.7px - ${ORIGIN}) + 10px)`,
+    )
+    expect(shiftedOffsetCss('calc(1px - var(--x))', 0)).toBe('calc(1px - var(--x))')
+    expect(shiftedOffsetCss('50%', 10)).toBeNull()
+    expect(shiftedOffsetCss('', 10)).toBeNull()
   })
 
   it('a page-relative Y above the body top lifts a side-wrapped run picture there', async () => {

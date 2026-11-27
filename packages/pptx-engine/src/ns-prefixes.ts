@@ -10,25 +10,32 @@
  *
  * canonicalizePrefixes resolves each element and attribute prefix to its
  * namespace URI through the in-scope xmlns declarations, and respells it with
- * the prefix the engine matches. Declarations are renamed along with it, so the
- * result is the same XML (same expanded names, same text), only spelled the way
- * PowerPoint writes it. Parts already on the conventional prefixes come back as
- * the identical string. PackageArchive.readText applies it, so parsing, byte
- * anchors and patch splices all see one text, while archive.entries keeps the
- * original bytes (an unedited save stays byte-identical).
+ * the prefix the engine matches. A renamed declaration is renamed where it
+ * stands (never dropped or moved), so every element keeps the declarations it
+ * had and a copied fragment stays self-contained. Where a descendant rebinds an
+ * output prefix to another namespace, the references below it that still mean
+ * the outer namespace get a declaration of their own. The result is the same
+ * XML (same expanded names, same text). Parts already on the conventional
+ * prefixes come back as the identical string.
+ *
+ * PackageArchive.readText applies it, so parsing, byte anchors and patch splices
+ * all see one text, while archive.entries keeps the original bytes (an unedited
+ * save stays byte-identical).
  */
 
 const T = 'http://schemas.openxmlformats.org/'
 const MS = 'http://schemas.microsoft.com/office/'
 const XML_NS = 'http://www.w3.org/XML/1998/namespace'
 const MC_URI = `${T}markup-compatibility/2006`
+const A_URI = `${T}drawingml/2006/main`
 const P_URI = `${T}presentationml/2006/main`
+const R_URI = `${T}officeDocument/2006/relationships`
 
 /** The prefixes the engine matches literally, keyed by namespace URI. */
 const CANONICAL_PREFIX_BY_URI: ReadonlyMap<string, string> = new Map([
-  [`${T}drawingml/2006/main`, 'a'],
+  [A_URI, 'a'],
   [P_URI, 'p'],
-  [`${T}officeDocument/2006/relationships`, 'r'],
+  [R_URI, 'r'],
   [MC_URI, 'mc'],
   [`${T}drawingml/2006/chart`, 'c'],
   [`${T}drawingml/2006/chartDrawing`, 'cdr'],
@@ -44,73 +51,53 @@ const CANONICAL_PREFIX_BY_URI: ReadonlyMap<string, string> = new Map([
   ['urn:schemas-microsoft-com:office:office', 'o'],
 ])
 
-/** Prefixes the slide generators write into presentation parts without declaring them. */
+/** Prefixes the slide generators write into a part without declaring them. */
 const GENERATED_PREFIXES: ReadonlyArray<readonly [prefix: string, uri: string]> = [
-  ['a', `${T}drawingml/2006/main`],
-  ['r', `${T}officeDocument/2006/relationships`],
+  ['a', A_URI],
+  ['r', R_URI],
   ['p', P_URI],
 ]
 
-const XMLNS_DECL_RE = /\bxmlns(?::([A-Za-z_][\w.-]*))?\s*=\s*(["'])(.*?)\2/g
+/** markup-compatibility attributes listing prefixes ("a14 p14") */
+const MCE_PREFIX_LISTS = new Set(['Ignorable', 'MustUnderstand'])
+/** markup-compatibility attributes listing qualified names ("p14:*", "v:shape") */
+const MCE_QNAME_LISTS = new Set(['ProcessContent', 'PreserveElements', 'PreserveAttributes'])
+
+const XMLNS_HINT_RE = /\bxmlns(?::([A-Za-z_][\w.-]*))?\s*=\s*(["'])(.*?)\2/g
 const TAG_NAME_RE = /^<\s*([^\s/>]+)/
 const ATTR_RE = /([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g
-
-/** Cheap pre-check: true when some known namespace is bound to a prefix the engine does not match. */
-export function needsPrefixCanonicalization(xml: string): boolean {
-  XMLNS_DECL_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = XMLNS_DECL_RE.exec(xml)) !== null) {
-    const canonical = CANONICAL_PREFIX_BY_URI.get(m[3]!)
-    if (canonical !== undefined && canonical !== (m[1] ?? '')) return true
-  }
-  return false
-}
+const SELF_CLOSING_RE = /\/\s*>$/
 
 interface Attr {
   name: string
   value: string
 }
 
-interface Frame {
-  /** end-tag name as written in the source, and as it goes out */
-  source: string
-  name: string
-  scoped: boolean
+interface TagToken {
+  start: number
+  /** exclusive */
+  end: number
+  close: boolean
 }
+
+const isDecl = (name: string): boolean => name === 'xmlns' || name.startsWith('xmlns:')
+const declPrefix = (name: string): string => (name === 'xmlns' ? '' : name.slice(6))
 
 function splitQName(name: string): [prefix: string, local: string] {
   const i = name.indexOf(':')
   return i < 0 ? ['', name] : [name.slice(0, i), name.slice(i + 1)]
 }
 
-const isDecl = (name: string): boolean => name === 'xmlns' || name.startsWith('xmlns:')
-
-/** Respell known namespaces with their canonical prefixes (see the module comment). */
-export function canonicalizePrefixes(xml: string): string {
-  if (!needsPrefixCanonicalization(xml)) return xml
-
-  // scope stacks; lookups walk from the top so inner declarations shadow outer ones
-  const bindings: Array<Map<string, string>> = [new Map([['xml', XML_NS]])] // source prefix -> URI
-  const renames: Array<Map<string, string>> = [new Map()] // source prefix -> output prefix
-  const outBindings: Array<Map<string, string>> = [new Map([['xml', XML_NS]])] // output prefix -> URI
-  const frames: Frame[] = []
-  const lookup = (stack: Array<Map<string, string>>, key: string): string | undefined => {
-    for (let i = stack.length - 1; i >= 0; i--) {
-      const v = stack[i]!.get(key)
-      if (v !== undefined) return v
-    }
-    return undefined
-  }
-  const renamePrefix = (prefix: string): string => lookup(renames, prefix) ?? prefix
-
-  let rootSeen = false
-  let out = ''
+/**
+ * Start and end tags in document order. Comments, CDATA, processing
+ * instructions and the doctype are skipped whole, and a '>' inside a quoted
+ * attribute value does not end a tag. An unterminated tag ends the walk.
+ */
+function* tagTokens(xml: string): Generator<TagToken> {
   let cursor = 0
   while (cursor < xml.length) {
     const start = xml.indexOf('<', cursor)
-    if (start < 0) break
-    out += xml.slice(cursor, start)
-
+    if (start < 0) return
     const specialEnd = xml.startsWith('<!--', start)
       ? '-->'
       : xml.startsWith('<![CDATA[', start)
@@ -122,13 +109,10 @@ export function canonicalizePrefixes(xml: string): string {
             : null
     if (specialEnd !== null) {
       const at = xml.indexOf(specialEnd, start + 2)
-      const end = at < 0 ? xml.length : at + specialEnd.length
-      out += xml.slice(start, end)
-      cursor = end
+      if (at < 0) return
+      cursor = at + specialEnd.length
       continue
     }
-
-    // the tag ends at the first '>' outside a quoted attribute value
     let quote = ''
     let end = start + 1
     for (; end < xml.length; end += 1) {
@@ -141,26 +125,130 @@ export function canonicalizePrefixes(xml: string): string {
         break
       }
     }
-    if (end >= xml.length) {
-      out += xml.slice(start)
-      cursor = xml.length
-      continue
-    }
-    const tag = xml.slice(start, end + 1)
+    if (end >= xml.length) return
+    yield { start, end: end + 1, close: xml[start + 1] === '/' }
     cursor = end + 1
+  }
+}
 
-    if (tag.startsWith('</')) {
+function attrsOf(tag: string, from: number): Attr[] {
+  const attrs: Attr[] = []
+  ATTR_RE.lastIndex = from
+  let m: RegExpExecArray | null
+  while ((m = ATTR_RE.exec(tag)) !== null) attrs.push({ name: m[1]!, value: m[2] ?? m[3] ?? '' })
+  return attrs
+}
+
+/**
+ * True when some start tag binds a known namespace to a prefix the engine does
+ * not match. Only real declarations count: the same text in element content,
+ * comments, CDATA or an attribute value does not.
+ */
+export function needsPrefixCanonicalization(xml: string): boolean {
+  // cheap text pre-filter first: most parts have no such declaration anywhere
+  XMLNS_HINT_RE.lastIndex = 0
+  let hint = false
+  let m: RegExpExecArray | null
+  while ((m = XMLNS_HINT_RE.exec(xml)) !== null) {
+    const canonical = CANONICAL_PREFIX_BY_URI.get(m[3]!)
+    if (canonical !== undefined && canonical !== (m[1] ?? '')) {
+      hint = true
+      break
+    }
+  }
+  if (!hint) return false
+  for (const t of tagTokens(xml)) {
+    if (t.close) continue
+    const tag = xml.slice(t.start, t.end)
+    if (!tag.includes('xmlns')) continue
+    const name = TAG_NAME_RE.exec(tag)
+    if (!name) continue
+    for (const a of attrsOf(tag, name[0].length)) {
+      if (!isDecl(a.name)) continue
+      const canonical = CANONICAL_PREFIX_BY_URI.get(a.value)
+      if (canonical !== undefined && canonical !== declPrefix(a.name)) return true
+    }
+  }
+  return false
+}
+
+interface Binding {
+  uri: string
+  /** the prefix this binding is written with in the output */
+  out: string
+}
+
+/**
+ * In-scope namespace bindings as one stack per prefix, so a lookup is O(1)
+ * however deep the document nests. Each open element logs what it pushed.
+ */
+class Scope {
+  private readonly src = new Map<string, Binding[]>()
+  private readonly out = new Map<string, string[]>()
+  private readonly log: Array<Array<() => void>> = [[]]
+
+  constructor() {
+    this.bind('xml', XML_NS, 'xml')
+    this.bindOut('xml', XML_NS)
+  }
+
+  open(): void {
+    this.log.push([])
+  }
+
+  close(): void {
+    const undo = this.log.pop() ?? []
+    for (let i = undo.length - 1; i >= 0; i--) undo[i]!()
+  }
+
+  /** source prefix → namespace + output spelling */
+  bind(prefix: string, uri: string, out: string): void {
+    let stack = this.src.get(prefix)
+    if (!stack) this.src.set(prefix, (stack = []))
+    stack.push({ uri, out })
+    this.log[this.log.length - 1]!.push(() => stack.pop())
+  }
+
+  /** what an output prefix means from here down */
+  bindOut(prefix: string, uri: string): void {
+    let stack = this.out.get(prefix)
+    if (!stack) this.out.set(prefix, (stack = []))
+    stack.push(uri)
+    this.log[this.log.length - 1]!.push(() => stack.pop())
+  }
+
+  top(prefix: string): Binding | undefined {
+    const stack = this.src.get(prefix)
+    return stack?.[stack.length - 1]
+  }
+
+  outUri(prefix: string): string | undefined {
+    const stack = this.out.get(prefix)
+    return stack?.[stack.length - 1]
+  }
+}
+
+/** Respell known namespaces with their canonical prefixes (see the module comment). */
+export function canonicalizePrefixes(xml: string): string {
+  if (!needsPrefixCanonicalization(xml)) return xml
+
+  const scope = new Scope()
+  const frames: Array<{ name: string; outName: string }> = []
+  let out = ''
+  let cursor = 0
+  for (const t of tagTokens(xml)) {
+    out += xml.slice(cursor, t.start)
+    cursor = t.end
+    const tag = xml.slice(t.start, t.end)
+
+    if (t.close) {
       const frame = frames.pop()
-      if (frame) {
-        out += frame.name === frame.source ? tag : `</${frame.name}>`
-        if (frame.scoped) {
-          bindings.pop()
-          renames.pop()
-          outBindings.pop()
-        }
-      } else {
+      if (!frame) {
         out += tag
+        continue
       }
+      scope.close()
+      out += frame.outName === frame.name ? tag : `</${frame.outName}>`
       continue
     }
 
@@ -170,160 +258,176 @@ export function canonicalizePrefixes(xml: string): string {
       continue
     }
     const name = nameMatch[1]!
-    const selfClosing = /\/\s*>$/.test(tag)
-    const attrs: Attr[] = []
-    ATTR_RE.lastIndex = nameMatch[0].length
-    let am: RegExpExecArray | null
-    while ((am = ATTR_RE.exec(tag)) !== null) {
-      attrs.push({ name: am[1]!, value: am[2] ?? am[3] ?? '' })
-    }
+    const attrs = attrsOf(tag, nameMatch[0].length)
+    const selfClosing = SELF_CLOSING_RE.test(tag)
     let changed = false
+    scope.open()
 
-    // The document element declares the prefixes renamed anywhere below it, and on a
-    // presentation part the ones the slide generators write undeclared, so edited
-    // fragments spliced in later stay namespace-valid.
-    if (!rootSeen) {
-      rootSeen = true
-      const declared = new Set(attrs.filter((a) => isDecl(a.name)).map((a) => a.name))
-      const wanted = new Map<string, string>()
-      XMLNS_DECL_RE.lastIndex = 0
-      let dm: RegExpExecArray | null
-      while ((dm = XMLNS_DECL_RE.exec(xml)) !== null) {
-        const uri = dm[3]!
-        const canonical = CANONICAL_PREFIX_BY_URI.get(uri)
-        if (canonical !== undefined && canonical !== (dm[1] ?? '')) wanted.set(canonical, uri)
+    // declarations: those keeping their prefix bind first, so a rename can neither
+    // take a prefix this element binds to something else nor be blocked by one
+    // that is itself renamed away
+    const declared = new Map<string, string>() // output prefix -> URI, on this element
+    const drop = new Set<Attr>()
+    for (const attr of attrs) {
+      if (!isDecl(attr.name)) continue
+      const prefix = declPrefix(attr.name)
+      const canonical = CANONICAL_PREFIX_BY_URI.get(attr.value)
+      if (canonical !== undefined && canonical !== prefix) continue
+      scope.bind(prefix, attr.value, prefix)
+      scope.bindOut(prefix, attr.value)
+      declared.set(prefix, attr.value)
+    }
+    for (const attr of attrs) {
+      if (!isDecl(attr.name)) continue
+      const prefix = declPrefix(attr.name)
+      const uri = attr.value
+      const canonical = CANONICAL_PREFIX_BY_URI.get(uri)
+      if (canonical === undefined || canonical === prefix) continue
+      const here = declared.get(canonical)
+      const current = here ?? scope.outUri(canonical)
+      if (current !== undefined && current !== uri) {
+        // the canonical prefix means another namespace here: keep this one as written
+        scope.bind(prefix, uri, prefix)
+        scope.bindOut(prefix, uri)
+        declared.set(prefix, uri)
+        continue
       }
-      const rootPrefix = splitQName(name)[0]
-      const rootDecl = rootPrefix === '' ? 'xmlns' : `xmlns:${rootPrefix}`
-      if (attrs.find((a) => a.name === rootDecl)?.value === P_URI) {
-        for (const [prefix, uri] of GENERATED_PREFIXES) wanted.set(prefix, uri)
-      }
-      for (const [prefix, uri] of wanted) {
-        if (declared.has(`xmlns:${prefix}`)) continue
-        attrs.push({ name: `xmlns:${prefix}`, value: uri })
+      scope.bind(prefix, uri, canonical)
+      if (prefix === '') {
+        // the default namespace keeps covering unprefixed content; the canonical
+        // prefix is declared beside it
+        scope.bindOut('', uri)
+        declared.set('', uri)
+        if (here !== uri) {
+          attrs.push({ name: `xmlns:${canonical}`, value: uri })
+          scope.bindOut(canonical, uri)
+          declared.set(canonical, uri)
+          changed = true
+        }
+      } else if (here === uri) {
+        drop.add(attr) // this element already declares the canonical prefix for it
+        changed = true
+      } else {
+        attr.name = `xmlns:${canonical}`
+        scope.bindOut(canonical, uri)
+        declared.set(canonical, uri)
         changed = true
       }
     }
 
-    // namespace declarations open a scope
-    const newBindings = new Map<string, string>()
-    const declByPrefix = new Map<string, Attr>()
-    for (const attr of attrs) {
-      if (!isDecl(attr.name)) continue
-      const declPrefix = attr.name === 'xmlns' ? '' : attr.name.slice(6)
-      newBindings.set(declPrefix, attr.value)
-      declByPrefix.set(declPrefix, attr)
+    // A reference whose output prefix a declaration between its binding and here
+    // rebinds to another namespace gets a declaration on this element: its own
+    // prefix when that is free here, a fresh one otherwise.
+    const resolve = (prefix: string): string => {
+      const b = scope.top(prefix)
+      if (!b || b.uri === '') return prefix
+      if (scope.outUri(b.out) === b.uri) return b.out
+      if (prefix === '' && scope.outUri('') === b.uri) {
+        scope.bind('', b.uri, '') // the default namespace still covers it
+        changed = true
+        return ''
+      }
+      let next = prefix
+      if (prefix === '' || (scope.outUri(prefix) ?? b.uri) !== b.uri) {
+        let k = 1
+        do next = `${prefix || 'ns'}-${k++}`
+        while (scope.outUri(next) !== undefined)
+      }
+      if (scope.outUri(next) !== b.uri) {
+        attrs.push({ name: `xmlns:${next}`, value: b.uri })
+        scope.bindOut(next, b.uri)
+        declared.set(next, b.uri)
+      }
+      scope.bind(prefix, b.uri, next)
+      changed = true
+      return next
     }
-    let scoped = false
-    if (newBindings.size > 0) {
-      scoped = true
-      bindings.push(newBindings)
-      const newRenames = new Map<string, string>()
-      renames.push(newRenames)
-      const newOut = new Map<string, string>()
-      outBindings.push(newOut)
-      const drop = new Set<Attr>()
-      // declarations keeping their prefix claim it in the output first, so a rename
-      // can neither steal it nor be blocked by a prefix that is itself renamed away
-      // (a kept declaration also shadows an outer rename of the same prefix)
-      for (const [prefix, uri] of newBindings) {
-        const canonical = CANONICAL_PREFIX_BY_URI.get(uri)
-        if (canonical === undefined || canonical === prefix) {
-          newOut.set(prefix, uri)
-          newRenames.set(prefix, prefix)
-        }
-      }
-      for (const [prefix, uri] of newBindings) {
-        const canonical = CANONICAL_PREFIX_BY_URI.get(uri)
-        if (canonical === undefined || canonical === prefix) continue
-        const bound = lookup(outBindings, canonical)
-        if (bound !== undefined && bound !== uri) {
-          // the canonical prefix means another namespace here: keep this one as written
-          newOut.set(prefix, uri)
-          newRenames.set(prefix, prefix)
-          continue
-        }
-        newRenames.set(prefix, canonical)
-        const decl = declByPrefix.get(prefix)!
-        if (prefix === '') {
-          // a default namespace keeps covering unprefixed content; the canonical
-          // prefix joins it unless already in scope
-          newOut.set('', uri)
-          if (bound !== uri) {
-            attrs.push({ name: `xmlns:${canonical}`, value: uri })
-            changed = true
-          }
-        } else if (bound === uri) {
-          drop.add(decl) // the canonical binding is already in scope
-          changed = true
-        } else {
-          decl.name = `xmlns:${canonical}`
-          changed = true
-        }
-        newOut.set(canonical, uri)
-      }
-      if (drop.size > 0) attrs.splice(0, attrs.length, ...attrs.filter((a) => !drop.has(a)))
+    const respell = (qname: string): string => {
+      if (!qname.includes(':')) return qname
+      const [p, local] = splitQName(qname)
+      const np = resolve(p)
+      return np === p ? qname : `${np}:${local}`
     }
 
     const [prefix, local] = splitQName(name)
-    const targetPrefix = lookup(bindings, prefix) === undefined ? prefix : renamePrefix(prefix)
-    const newName = targetPrefix === '' ? local : `${targetPrefix}:${local}`
+    const elementUri = scope.top(prefix)?.uri
+    const outPrefix = resolve(prefix)
+    const newName = outPrefix === '' ? local : `${outPrefix}:${local}`
     if (newName !== name) changed = true
 
-    const elementUri = lookup(bindings, prefix)
-    for (const attr of attrs) {
-      if (isDecl(attr.name)) continue
+    const own = attrs.length
+    for (let i = 0; i < own; i++) {
+      const attr = attrs[i]!
+      if (isDecl(attr.name) || drop.has(attr)) continue
       const [ap, al] = splitQName(attr.name)
-      if (ap !== '' && ap !== 'xml') {
-        const np = renamePrefix(ap)
-        if (np !== ap) {
-          attr.name = `${np}:${al}`
+      const attrUri = ap === '' ? undefined : scope.top(ap)?.uri
+      if (ap !== '') {
+        const renamed = respell(attr.name)
+        if (renamed !== attr.name) {
+          attr.name = renamed
           changed = true
         }
       }
-      // markup-compatibility prefix lists keep naming the renamed prefixes
-      const mceList =
-        ((al === 'Ignorable' || al === 'MustUnderstand' || al === 'ProcessContent') &&
-          ap !== '' &&
-          lookup(bindings, ap) === MC_URI) ||
-        (al === 'Requires' && ap === '' && elementUri === MC_URI)
-      if (mceList) {
-        const renamed = attr.value
-          .split(/(\s+)/)
-          .map((part) => (/^\s*$/.test(part) ? part : renameListEntry(part, renamePrefix)))
-          .join('')
-        if (renamed !== attr.value) {
-          attr.value = renamed
-          changed = true
-        }
+      // markup-compatibility lists keep naming the prefixes as written in the output
+      let value = attr.value
+      if (attrUri === MC_URI && MCE_PREFIX_LISTS.has(al)) {
+        value = mapList(attr.value, resolve)
+      } else if (attrUri === MC_URI && MCE_QNAME_LISTS.has(al)) {
+        value = mapList(attr.value, respell)
+      } else if (ap === '' && al === 'Requires' && elementUri === MC_URI) {
+        value = mapList(attr.value, resolve)
+      }
+      if (value !== attr.value) {
+        attr.value = value
+        changed = true
       }
     }
 
     if (changed) {
-      const attrText = attrs.map((a) => ` ${a.name}="${a.value.replace(/"/g, '&quot;')}"`).join('')
+      const attrText = attrs
+        .filter((a) => !drop.has(a))
+        .map((a) => ` ${a.name}="${a.value.replace(/"/g, '&quot;')}"`)
+        .join('')
       out += `<${newName}${attrText}${selfClosing ? '/>' : '>'}`
     } else {
       out += tag
     }
 
-    if (selfClosing) {
-      if (scoped) {
-        bindings.pop()
-        renames.pop()
-        outBindings.pop()
-      }
-    } else {
-      frames.push({ source: name, name: newName, scoped })
-    }
+    if (selfClosing) scope.close()
+    else frames.push({ name, outName: newName })
   }
   out += xml.slice(cursor)
   return out
 }
 
-/** One entry of an MCE list: a bare prefix ("a14") or a qualified name ("p14:*"). */
-function renameListEntry(entry: string, renamePrefix: (prefix: string) => string): string {
-  const [prefix, local] = splitQName(entry)
-  if (!entry.includes(':')) return renamePrefix(entry)
-  const np = renamePrefix(prefix)
-  return np === prefix ? entry : `${np}:${local}`
+function mapList(value: string, map: (entry: string) => string): string {
+  return value
+    .split(/(\s+)/)
+    .map((part) => (part === '' || /^\s+$/.test(part) ? part : map(part)))
+    .join('')
+}
+
+/**
+ * The part with its document element declaring a:, r: and p: where it lacks
+ * them. The slide generators write those prefixes undeclared, so a part that
+ * declares DrawingML only locally (lxml output) needs them on the root once an
+ * edit rewrites it. A root binding one of them to another namespace keeps it.
+ */
+export function declareGeneratedPrefixes(xml: string): string {
+  for (const t of tagTokens(xml)) {
+    if (t.close) return xml
+    const tag = xml.slice(t.start, t.end)
+    const name = TAG_NAME_RE.exec(tag)
+    if (!name) return xml
+    const declared = new Set(attrsOf(tag, name[0].length).map((a) => a.name))
+    const missing = GENERATED_PREFIXES.filter(([prefix]) => !declared.has(`xmlns:${prefix}`))
+    if (missing.length === 0) return xml
+    const insertAt = t.start + tag.search(/\s*\/?\s*>$/)
+    return (
+      xml.slice(0, insertAt) +
+      missing.map(([prefix, uri]) => ` xmlns:${prefix}="${uri}"`).join('') +
+      xml.slice(insertAt)
+    )
+  }
+  return xml
 }
