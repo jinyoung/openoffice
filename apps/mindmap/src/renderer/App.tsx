@@ -646,6 +646,7 @@ export default function App() {
       <Toolbar
         disabled={!controller}
         dirty={dirty}
+        typing={controller?.editingText ?? false}
         statusText={statusText}
         canUndo={controller?.canUndo ?? false}
         canRedo={controller?.canRedo ?? false}

@@ -872,6 +872,8 @@ export class MapController {
     // Opening the edit box changes nothing yet, and the library records no step for it.
     if (operation.name === 'beginEdit') {
       this.#dressEditBox(operation.obj.id)
+      // a title being typed is something to save before it is in the tree: the toolbar's Save follows
+      this.#host.onStateChange()
       return
     }
     // The session recorded this step and the screen was drawn from it: nothing to reconcile.

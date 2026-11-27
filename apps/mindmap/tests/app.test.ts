@@ -166,6 +166,17 @@ const click = async (selector: string): Promise<void> => {
 const topicEl = (id: string): HTMLElement =>
   container.querySelector<HTMLElement>(`[data-nodeid="me${id}"]`)!
 
+const saveButton = (): HTMLButtonElement =>
+  container.querySelector<HTMLButtonElement>('[data-action="save"]')!
+
+/** Ctrl+S: the save asked by key (the button is off while nothing is new) */
+async function pressSaveKey(): Promise<void> {
+  await act(async () => {
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 's', ctrlKey: true, bubbles: true }))
+  })
+  await settle()
+}
+
 async function pressOnMap(key: string): Promise<void> {
   const map = container.querySelector<HTMLElement>('.map-container')!
   await act(async () => {
@@ -271,11 +282,28 @@ describe('a file that opens', () => {
   it('opening changes nothing: the unsaved mark stays off and a save hands over the original bytes', async () => {
     const { fake, bytes } = await openWith(richSheet(), plainSheet())
     expect(fake.dirty.at(-1)).toBe(false)
-    await click('[data-action="save"]')
+    // nothing new: the save button is off (a host reads it as "nothing to save"); Ctrl+S still saves
+    expect(saveButton().disabled).toBe(true)
+    await pressSaveKey()
     await savesReach(fake)
     expect(fake.saves).toHaveLength(1)
     expect(fake.saves[0]!.mode).toBe('save')
     expect(fake.saves[0]!.bytes).toEqual(bytes)
+  })
+
+  it('the save button is on only with something to save: a title being typed, a changed map; off again once saved', async () => {
+    const { fake } = await openWith(plainSheet())
+    expect(saveButton().disabled).toBe(true)
+    // the title is still in its box (not in the tree, the map not dirty yet): the button takes it
+    await typeTitle('cccccccc-cccc-4ccc-8ccc-ccccccccccc1', 'Changed')
+    expect(fake.dirty.at(-1)).toBe(false)
+    expect(saveButton().disabled).toBe(false)
+    await click('[data-action="save"]')
+    await savesReach(fake)
+    const saved = await openXmind(fake.saves[0]!.bytes)
+    if (saved.status !== 'ok') throw new Error('did not open')
+    expect(saved.document.sheets[0]!.rootTopic.children!.attached![0]!.title).toBe('Changed')
+    await until(() => saveButton().disabled, 'the button to go off after the save')
   })
 
   it('marks an automatic save as one and a save by hand as not, for the copy-pair guard', async () => {
@@ -290,7 +318,7 @@ describe('a file that opens', () => {
     await savesReach(fake)
     expect(fake.saves[0]!.auto).toBe(true)
 
-    await click('[data-action="save"]')
+    await pressSaveKey()
     await savesReach(fake, 2)
     expect(fake.saves[1]!.auto).toBe(false)
   })
@@ -440,7 +468,7 @@ describe('a new map', () => {
     expect(container.querySelector('me-root me-tpc .text')!.textContent).toBe('Central Topic')
     expect(fake.dirty.at(-1)).toBe(false)
 
-    await click('[data-action="save"]')
+    await pressSaveKey()
     await savesReach(fake)
     const reopened = await openXmind(fake.saves[0]!.bytes)
     expect(reopened.status).toBe('ok')
@@ -534,7 +562,7 @@ describe('the theme panel', () => {
       'Tinted',
     ])
     expect(fake.dirty.at(-1)).toBe(false)
-    await click('[data-action="save"]')
+    await pressSaveKey()
     await savesReach(fake)
     expect(fake.saves[0]!.bytes).toEqual(bytes)
     await click('[data-action="theme-close"]')

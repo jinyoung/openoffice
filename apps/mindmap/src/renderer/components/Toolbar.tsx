@@ -38,6 +38,11 @@ import {
 export interface ToolbarProps {
   disabled: boolean
   dirty: boolean
+  /**
+   * a title is being typed on the map (not in the tree, nor dirty, until its box closes): Save stays on.
+   * Otherwise Save is off while nothing is new, so a host can read it as "nothing to save".
+   */
+  typing: boolean
   /** what the status line says about saving */
   statusText: string
   canUndo: boolean
@@ -96,7 +101,7 @@ export function Toolbar(p: ToolbarProps) {
           data-action="save"
           data-tip={t('save')}
           aria-label={t('save')}
-          disabled={p.disabled}
+          disabled={p.disabled || !(p.dirty || p.typing)}
           onClick={p.onSave}
         >
           <IconSave />
