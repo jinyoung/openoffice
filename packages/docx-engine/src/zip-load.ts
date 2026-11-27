@@ -85,6 +85,9 @@ export function assertZipWithinLimits(zip: JSZip): void {
 // package needs normalizing (strict packages are strict in document.xml and
 // their rels; prefix oddities live in document.xml).
 const NORMALIZE_GATE_PARTS = ['word/document.xml', 'word/_rels/document.xml.rels', '_rels/.rels']
+// A tool that re-serialized only one story part (lxml writing a header back as
+// ns0:hdr) leaves its prefixes there alone, so the other parsed stories gate too.
+const NORMALIZE_GATE_STORY = /^word\/(?:header\d*|footer\d*|footnotes|endnotes|comments)\.xml$/
 
 /**
  * ISO Strict OOXML and non-canonical namespace prefixes are normalized here,
@@ -93,7 +96,11 @@ const NORMALIZE_GATE_PARTS = ['word/document.xml', 'word/_rels/document.xml.rels
  */
 async function normalizeOoxmlParts(zip: JSZip): Promise<void> {
   let needed = false
-  for (const path of NORMALIZE_GATE_PARTS) {
+  const gate = [
+    ...NORMALIZE_GATE_PARTS,
+    ...Object.keys(zip.files).filter((name) => NORMALIZE_GATE_STORY.test(name)),
+  ]
+  for (const path of gate) {
     const file = zip.file(path)
     if (file && needsOoxmlNormalization(await file.async('string'))) {
       needed = true

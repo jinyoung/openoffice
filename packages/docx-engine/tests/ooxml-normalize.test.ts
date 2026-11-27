@@ -2,7 +2,8 @@ import JSZip from 'jszip'
 import { describe, expect, it } from 'vitest'
 import { needsOoxmlNormalization, normalizeOoxmlXml } from '../src/ooxml-normalize'
 import { loadDocxZip } from '../src/zip-load'
-import { parseDocx } from '../src/index'
+import { parseDocx, saveDocx, type SaveBlock } from '../src/index'
+import { buildDocx } from './helpers/build-docx'
 
 const XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 const W_TRANS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -252,5 +253,30 @@ describe('parseDocx over normalized packages', () => {
     const normalized = await zip.file('word/document.xml')!.async('string')
     expect(normalized).toContain('<w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/>')
     expect(normalized).not.toContain('conformance')
+  })
+})
+
+describe('a story part re-serialized with its own prefixes', () => {
+  // lxml writing back only header1.xml spells WordprocessingML as ns0:, while
+  // document.xml stays canonical: the header used to come back empty
+  it('normalizes a header even when document.xml is canonical', async () => {
+    const parsed = await parseDocx(
+      await buildDocx({ bodyXml: '<w:p><w:r><w:t>Body</w:t></w:r></w:p>' }),
+    )
+    const saveBlocks: SaveBlock[] = [{ kind: 'original', docxIndex: parsed.blocks[0].docxIndex! }]
+    const saved = await saveDocx(parsed, saveBlocks, {
+      header: { text: '', paras: [{ runs: [{ text: 'Header text' }] }] },
+    })
+    const zip = await JSZip.loadAsync(saved)
+    const hdr = Object.keys(zip.files).find((n) => /^word\/header\d*\.xml$/.test(n))!
+    const xml = await zip.file(hdr)!.async('string')
+    const lxmlStyle = xml
+      .replace(/xmlns:w=/g, 'xmlns:ns0=')
+      .replace(/<(\/?)w:/g, '<$1ns0:')
+      .replace(/ w:/g, ' ns0:')
+    expect(lxmlStyle).not.toContain('<w:')
+    zip.file(hdr, lxmlStyle)
+    const reparsed = await parseDocx(await zip.generateAsync({ type: 'uint8array' }))
+    expect(reparsed.headerText).toBe('Header text')
   })
 })

@@ -12,6 +12,10 @@ import { createHash } from 'node:crypto'
 import { XMLParser } from 'fast-xml-parser'
 import type { SlideSize } from './types'
 import { asXmlNode, xmlArray } from './xml-utils'
+import { canonicalizePrefixes, needsPrefixCanonicalization } from './ns-prefixes'
+
+/** Respelled text of the parts that needed it (most parts never get an entry). */
+const canonicalTextCache = new WeakMap<Uint8Array, string>()
 
 const relsParser = new XMLParser({
   ignoreAttributes: false,
@@ -91,11 +95,22 @@ export class PackageArchive {
     return this.entries.has(path)
   }
 
-  /** Read a part as a UTF-8 string (for XML parts). */
+  /**
+   * Read a part as a UTF-8 string (for XML parts). Namespaces bound to unconventional
+   * prefixes (lxml's ns0:, ns1:...) come back respelled with the prefixes the engine
+   * matches (ns-prefixes.ts); entries keep the original bytes.
+   */
   readText(path: string): string | null {
     const bytes = this.entries.get(path)
     if (!bytes) return null
-    return Buffer.from(bytes).toString('utf8')
+    const cached = canonicalTextCache.get(bytes)
+    if (cached !== undefined) return cached
+    const text = Buffer.from(bytes).toString('utf8')
+    if (!needsPrefixCanonicalization(text)) return text
+    // entries are replaced, never edited in place, so the buffer identifies the text
+    const canonical = canonicalizePrefixes(text)
+    canonicalTextCache.set(bytes, canonical)
+    return canonical
   }
 
   readBytes(path: string): Uint8Array | null {

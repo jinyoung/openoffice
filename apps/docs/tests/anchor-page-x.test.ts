@@ -63,7 +63,9 @@ async function runImageStyle(bodyXml: string): Promise<string> {
         HTMLAttributes: object
       }) => unknown[]
     ).call(DocInlineImage, { node, HTMLAttributes: {} })
-    style = String((spec[1] as Record<string, string>).style ?? '')
+    // wrapNone / behind-text pictures come wrapped in their anchor span
+    const img = spec[0] === 'span' && Array.isArray(spec[2]) ? (spec[2] as unknown[]) : spec
+    style = String((img[1] as Record<string, string>).style ?? '')
     return false
   })
   return style
@@ -85,6 +87,33 @@ describe('page-relative anchor x', () => {
       `<w:p>${anchor(PAGE_H, PARA_V, '<wp:wrapSquare wrapText="right"/>')}<w:r><w:t>T</w:t></w:r></w:p>`,
     )
     expect(style).toContain('margin-left:calc(46.7px - var(--doc-margin-left,0px))')
+  })
+
+  // a full-page cover picture (behindDoc, wrapNone, page 0/0) sharing the cover's
+  // first paragraph used to land one left margin to the right: its left band then
+  // covered the kicker's first letters
+  it('a run-level behind-text picture measures x from the paper edge', async () => {
+    const style = await runImageStyle(
+      `<w:p><w:r><w:t>Kicker</w:t></w:r>${anchor(PAGE_H, PAGE_V, '<wp:wrapNone/>')}</w:p>`,
+    )
+    // 444500 EMU = 46.7px from the paper edge; the margin comes off in CSS, the
+    // negative part in left and the positive part in the transform
+    expect(style).toContain('left:min(0px, calc(46.7px - var(--doc-margin-left,0px)))')
+    expect(style).toContain('translate(max(0px, calc(46.7px - var(--doc-margin-left,0px))), ')
+  })
+
+  it('a column-relative behind-text run picture keeps its column x', async () => {
+    const style = await runImageStyle(
+      `<w:p><w:r><w:t>T</w:t></w:r>${anchor(COLUMN_H, PARA_V, '<wp:wrapNone/>')}</w:p>`,
+    )
+    expect(style).toContain('left:-32.7px')
+    expect(style).toContain('translate(0.0px, 24.4px)')
+  })
+
+  it('a behind-text picture alone in its paragraph measures x from the paper edge', async () => {
+    const dom = await render(`<w:p>${anchor(PAGE_H, PAGE_V, '<wp:wrapNone/>')}</w:p>`)
+    const wrap = dom.querySelector<HTMLElement>('.doc-img-float .doc-img-wrap')!
+    expect(wrap.style.left).toBe('calc(46.7px - var(--doc-margin-left,0px))')
   })
 
   it('a page-relative Y above the body top lifts a side-wrapped run picture there', async () => {

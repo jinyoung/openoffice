@@ -1218,9 +1218,17 @@ export const DocInlineImage = Node.create({
       // page-relative Y in content-area coordinates; pagination re-pins it on the anchor's page
       const dy =
         relV === 'page' ? `calc(${px(top - ty)} - var(--doc-margin-top,0px))` : px(top - ty)
+      // positionH page: the offset measures from the paper edge, one left margin
+      // before the column (a full-page cover picture at x=0 otherwise lands a margin
+      // to the right, over the cover text). Only CSS knows the margin, so min/max
+      // split the content-area X the same way: negative in left, positive in transform.
+      const fromPaperX =
+        node.attrs.relH === 'page' ? `calc(${px(left)} - var(--doc-margin-left,0px))` : null
+      const leftCss = fromPaperX ? `min(0px, ${fromPaperX})` : px(lx)
+      const dx = fromPaperX ? `max(0px, ${fromPaperX})` : px(left - lx)
       styles.push(
-        `position:absolute;left:${px(lx)};top:${px(ty)}`,
-        `transform:translate(${px(left - lx)}, ${dy})${xf.length ? ` ${xf.join(' ')}` : ''}`,
+        `position:absolute;left:${leftCss};top:${px(ty)}`,
+        `transform:translate(${dx}, ${dy})${xf.length ? ` ${xf.join(' ')}` : ''}`,
         'max-width:none',
       )
       attrs.style = styles.join(';')
@@ -4924,7 +4932,7 @@ function protectedDomSpec(node: PmNode): DomSpec {
       } else if (posH === 'right') {
         imgFloatPos = `right:0;top:${topCss}${imgZIndexCss}`
       } else {
-        imgFloatPos = `left:${tx.toFixed(1)}px;top:${topCss}${imgZIndexCss}`
+        imgFloatPos = `left:${fromPageX(`${tx.toFixed(1)}px`)};top:${topCss}${imgZIndexCss}`
       }
     } else if (banded) {
       const tx = Number(node.attrs.imageOffsetXEmu) / EMU_PER_PX
