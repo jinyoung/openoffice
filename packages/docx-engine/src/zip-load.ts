@@ -1,6 +1,7 @@
 import JSZip from 'jszip'
 import { assertDeclaredSizesWithinLimits, assertZipInflatesWithinLimits } from '@genoffice/zip-gate'
 import { needsOoxmlNormalization, normalizeOoxmlXml } from './ooxml-normalize'
+import { parseRels, resolveRelationshipTargetPath } from './parse-package'
 
 // Re-exported for the engine's public API (index.ts) and the CLI's pre-open
 // check: the implementations live in @genoffice/zip-gate so the pptx engine
@@ -85,6 +86,10 @@ export function assertZipWithinLimits(zip: JSZip): void {
 // package needs normalizing (strict packages are strict in document.xml and
 // their rels; prefix oddities live in document.xml).
 const NORMALIZE_GATE_PARTS = ['word/document.xml', 'word/_rels/document.xml.rels', '_rels/.rels']
+// A tool that re-serialized only one story part (lxml writing a header back as
+// ns0:hdr) leaves its prefixes there alone, so the other stories the engine
+// parses gate too: found by relationship type, whatever their part names.
+const NORMALIZE_GATE_STORY_REL = /\/(?:header|footer|footnotes|endnotes|comments)$/
 
 /**
  * ISO Strict OOXML and non-canonical namespace prefixes are normalized here,
@@ -93,7 +98,13 @@ const NORMALIZE_GATE_PARTS = ['word/document.xml', 'word/_rels/document.xml.rels
  */
 async function normalizeOoxmlParts(zip: JSZip): Promise<void> {
   let needed = false
-  for (const path of NORMALIZE_GATE_PARTS) {
+  const gate = [...NORMALIZE_GATE_PARTS]
+  for (const rel of (await parseRels(zip, 'word/_rels/document.xml.rels')).values()) {
+    if (rel.targetMode === 'External' || !NORMALIZE_GATE_STORY_REL.test(rel.type)) continue
+    const target = resolveRelationshipTargetPath('word/document.xml', rel.target)
+    if (target) gate.push(target)
+  }
+  for (const path of gate) {
     const file = zip.file(path)
     if (file && needsOoxmlNormalization(await file.async('string'))) {
       needed = true

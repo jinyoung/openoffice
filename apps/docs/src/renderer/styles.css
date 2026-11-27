@@ -2765,6 +2765,18 @@ th.cell-rev-del {
   transform: translateX(calc(-1 * var(--col-dx, 0px)));
 }
 
+/* positionH="page" overlay pictures place themselves with an inline transform,
+   so they take the same column shift as a length to subtract instead
+   (extensions.ts pagePictureOriginCss) */
+.editor-scroll .doc-page:not(.measuring-columns) .doc-col-block {
+  --doc-col-undo: var(--col-dx, 0px);
+}
+
+/* a layoutInCell picture positions from its table cell, not from the paper edge */
+.doc-page :is(td, th) {
+  --doc-img-cell-origin: 0px;
+}
+
 /* sectPr w:textDirection sections (verticalTextSpecs): blocks are measured as
    horizontal paragraphs wrapping at the line length (--col-w) and shown as
    writing-mode boxes of that height, translated to their sideways slot. The

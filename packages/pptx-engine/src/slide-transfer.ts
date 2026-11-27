@@ -380,6 +380,12 @@ function partText(parts: Readonly<Record<string, string>>, path: string): string
   return base64 == null ? null : Buffer.from(base64, 'base64').toString('utf8')
 }
 
+/** A part as written: bundles carry raw bytes, while readText may respell prefixes. */
+function rawText(archive: PackageArchive, path: string): string | null {
+  const bytes = archive.readBytes(path)
+  return bytes ? Buffer.from(bytes).toString('utf8') : null
+}
+
 /**
  * A target layout whose XML, owning master and theme are byte-identical to the
  * bundled chain — i.e. this chain was already imported (or the decks share the
@@ -393,17 +399,17 @@ function findIdenticalLayout(
 ): string | null {
   for (const path of archive.entries.keys()) {
     if (!/^ppt\/slideMasters\/slideMaster\d+\.xml$/.test(path)) continue
-    if (archive.readText(path) !== masterXml) continue
+    if (rawText(archive, path) !== masterXml) continue
     const rels = [...archive.readRels(path).values()]
     if (themeXml != null) {
       const themeRel = rels.find((r) => r.type.endsWith('/theme'))
       const themePath = themeRel ? resolveTarget(path, themeRel.target) : null
-      if (!themePath || archive.readText(themePath) !== themeXml) continue
+      if (!themePath || rawText(archive, themePath) !== themeXml) continue
     }
     for (const rel of rels) {
       if (!rel.type.endsWith(LAYOUT_REL)) continue
       const layoutPath = resolveTarget(path, rel.target)
-      if (archive.readText(layoutPath) === layoutXml) return layoutPath
+      if (rawText(archive, layoutPath) === layoutXml) return layoutPath
     }
   }
   return null

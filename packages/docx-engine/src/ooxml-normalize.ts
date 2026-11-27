@@ -9,6 +9,7 @@
 const T = 'http://schemas.openxmlformats.org/'
 const S = 'http://purl.oclc.org/ooxml/'
 const MS = 'http://schemas.microsoft.com/office/'
+const XML_NS = 'http://www.w3.org/XML/1998/namespace'
 
 /** ISO 29500 Strict namespace -> ECMA transitional equivalent (official 1:1 pairs) */
 const STRICT_TO_TRANSITIONAL: ReadonlyMap<string, string> = new Map([
@@ -179,16 +180,86 @@ function mapUriValue(value: string): string {
 
 const XMLNS_DECL_RE = /xmlns(?::([A-Za-z_][\w.-]*))?\s*=\s*(["'])([^"']*)\2/g
 
-/** Cheap pre-check; normalizeOoxmlXml is only worth calling when this is true. */
+/**
+ * True when a start tag declares a strict namespace, names a strict relationship
+ * type, or binds a known namespace to an unconventional prefix. The same text in
+ * element content, comments, CDATA or another attribute value does not count.
+ */
 export function needsOoxmlNormalization(xml: string): boolean {
-  if (xml.includes(S)) return true
-  XMLNS_DECL_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = XMLNS_DECL_RE.exec(xml)) !== null) {
-    const canonical = CANONICAL_PREFIX_BY_URI.get(m[3]!)
-    if (canonical !== undefined && canonical !== (m[1] ?? '')) return true
+  // cheap text pre-filter: most parts carry neither marker anywhere
+  let hint = xml.includes(S)
+  if (!hint) {
+    XMLNS_DECL_RE.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = XMLNS_DECL_RE.exec(xml)) !== null) {
+      const canonical = CANONICAL_PREFIX_BY_URI.get(m[3]!)
+      if (canonical !== undefined && canonical !== (m[1] ?? '')) {
+        hint = true
+        break
+      }
+    }
+  }
+  if (!hint) return false
+  for (const t of startTags(xml)) {
+    if (!t.includes('xmlns') && !t.includes('Type')) continue
+    ATTR_RE.lastIndex = TAG_NAME_RE.exec(t)?.[0].length ?? t.length
+    let am: RegExpExecArray | null
+    while ((am = ATTR_RE.exec(t)) !== null) {
+      const name = am[1]!
+      const value = am[2] ?? am[3] ?? ''
+      if (name === 'Type' && value.startsWith(STRICT_REL_BASE)) return true
+      if (name !== 'xmlns' && !name.startsWith('xmlns:')) continue
+      if (value.startsWith(S)) return true
+      const canonical = CANONICAL_PREFIX_BY_URI.get(value)
+      if (canonical !== undefined && canonical !== (name === 'xmlns' ? '' : name.slice(6))) {
+        return true
+      }
+    }
   }
   return false
+}
+
+/**
+ * Start tags in document order: comments, CDATA, processing instructions and the
+ * doctype are skipped whole, and a '>' inside a quoted attribute value does not
+ * end a tag.
+ */
+function* startTags(xml: string): Generator<string> {
+  let cursor = 0
+  while (cursor < xml.length) {
+    const start = xml.indexOf('<', cursor)
+    if (start < 0) return
+    const specialEnd = xml.startsWith('<!--', start)
+      ? '-->'
+      : xml.startsWith('<![CDATA[', start)
+        ? ']]>'
+        : xml.startsWith('<?', start)
+          ? '?>'
+          : xml.startsWith('<!', start)
+            ? '>'
+            : null
+    if (specialEnd !== null) {
+      const at = xml.indexOf(specialEnd, start + 2)
+      if (at < 0) return
+      cursor = at + specialEnd.length
+      continue
+    }
+    let quote = ''
+    let end = start + 1
+    for (; end < xml.length; end += 1) {
+      const ch = xml[end]!
+      if (quote) {
+        if (ch === quote) quote = ''
+      } else if (ch === '"' || ch === "'") {
+        quote = ch
+      } else if (ch === '>') {
+        break
+      }
+    }
+    if (end >= xml.length) return
+    if (xml[start + 1] !== '/') yield xml.slice(start, end + 1)
+    cursor = end + 1
+  }
 }
 
 interface Attr {
@@ -199,8 +270,64 @@ interface Attr {
 interface Frame {
   /** rewritten name to emit for the matching end tag */
   name: string
-  scoped: boolean
   wspScope: boolean
+}
+
+interface Binding {
+  uri: string
+  /** the prefix this binding is written with in the output */
+  out: string
+}
+
+/**
+ * In-scope namespace bindings as one stack per prefix, so a lookup is O(1)
+ * however deep the document nests (a frame-by-frame walk went quadratic on a
+ * declaration at every level). Each open element logs what it pushed.
+ */
+class NsScope {
+  private readonly src = new Map<string, Binding[]>()
+  private readonly out = new Map<string, string[]>()
+  private readonly log: Array<Array<() => void>> = [[]]
+
+  constructor() {
+    this.bind('xml', XML_NS, 'xml')
+    this.bindOut('xml', XML_NS)
+  }
+
+  open(): void {
+    this.log.push([])
+  }
+
+  close(): void {
+    const undo = this.log.pop() ?? []
+    for (let i = undo.length - 1; i >= 0; i--) undo[i]!()
+  }
+
+  /** source prefix -> namespace + output spelling */
+  bind(prefix: string, uri: string, out: string): void {
+    let stack = this.src.get(prefix)
+    if (!stack) this.src.set(prefix, (stack = []))
+    stack.push({ uri, out })
+    this.log[this.log.length - 1]!.push(() => stack.pop())
+  }
+
+  /** what an output prefix means from here down */
+  bindOut(prefix: string, uri: string): void {
+    let stack = this.out.get(prefix)
+    if (!stack) this.out.set(prefix, (stack = []))
+    stack.push(uri)
+    this.log[this.log.length - 1]!.push(() => stack.pop())
+  }
+
+  top(prefix: string): Binding | undefined {
+    const stack = this.src.get(prefix)
+    return stack?.[stack.length - 1]
+  }
+
+  outUri(prefix: string): string | undefined {
+    const stack = this.out.get(prefix)
+    return stack?.[stack.length - 1]
+  }
 }
 
 const TAG_NAME_RE = /^<\/?\s*([^\s/>]+)/
@@ -212,21 +339,22 @@ function splitQName(name: string): [prefix: string, local: string] {
 }
 
 export function normalizeOoxmlXml(xml: string): string {
-  // scope stacks; lookups walk from the top so inner declarations shadow outer ones
-  const bindings: Array<Map<string, string>> = [new Map()] // source prefix -> transitional URI
-  const renames: Array<Map<string, string>> = [new Map()] // source prefix -> output prefix
-  const outBindings: Array<Map<string, string>> = [new Map()] // output prefix -> transitional URI
+  const scope = new NsScope()
+  /** last number handed out per base of a fresh prefix ('ns' for the default namespace) */
+  const fresh = new Map<string, number>()
+  /** an output prefix unbound here; one counter per base only climbs, so no
+   *  search restarts from the first name */
+  const freshPrefix = (source: string): string => {
+    const base = source || 'ns'
+    let k = fresh.get(base) ?? 0
+    let next: string
+    do next = `${base}-${++k}`
+    while (scope.outUri(next) !== undefined)
+    fresh.set(base, k)
+    return next
+  }
   const frames: Frame[] = []
   let wspDepth = 0
-
-  const lookup = (stack: Array<Map<string, string>>, key: string): string | undefined => {
-    for (let i = stack.length - 1; i >= 0; i--) {
-      const v = stack[i]!.get(key)
-      if (v !== undefined) return v
-    }
-    return undefined
-  }
-  const renamePrefix = (prefix: string): string => lookup(renames, prefix) ?? prefix
 
   let out = ''
   let cursor = 0
@@ -277,11 +405,7 @@ export function normalizeOoxmlXml(xml: string): string {
       const frame = frames.pop()
       if (frame) {
         out += `</${frame.name}>`
-        if (frame.scoped) {
-          bindings.pop()
-          renames.pop()
-          outBindings.pop()
-        }
+        scope.close()
         if (frame.wspScope) wspDepth -= 1
       } else {
         out += tag
@@ -302,79 +426,101 @@ export function normalizeOoxmlXml(xml: string): string {
       attrs.push({ name: am[1]!, value: am[2] ?? am[3] ?? '' })
     }
 
-    // namespace declarations open a scope; strict URIs map to transitional
-    const newBindings = new Map<string, string>()
+    // namespace declarations; strict URIs map to transitional
+    scope.open()
     const declByPrefix = new Map<string, Attr>()
     for (const attr of attrs) {
       if (attr.name !== 'xmlns' && !attr.name.startsWith('xmlns:')) continue
       attr.value = mapUriValue(attr.value)
-      const declPrefix = attr.name === 'xmlns' ? '' : attr.name.slice(6)
-      newBindings.set(declPrefix, attr.value)
-      declByPrefix.set(declPrefix, attr)
+      declByPrefix.set(attr.name === 'xmlns' ? '' : attr.name.slice(6), attr)
     }
-    let scoped = false
-    if (newBindings.size > 0) {
-      scoped = true
-      bindings.push(newBindings)
-      const newRenames = new Map<string, string>()
-      renames.push(newRenames)
-      const newOut = new Map<string, string>()
-      outBindings.push(newOut)
+    if (declByPrefix.size > 0) {
       const drop = new Set<Attr>()
       const inject: Attr[] = []
+      /** output prefixes a rename or injection declared on this element */
+      const renamedHere = new Set<string>()
       // declarations that keep their prefix claim it in the output first, so a
       // rename can neither steal it nor be blocked by a prefix that is itself
       // being renamed away
-      for (const [prefix, uri] of newBindings) {
-        const canonical = CANONICAL_PREFIX_BY_URI.get(uri)
-        if (canonical === undefined || canonical === prefix) newOut.set(prefix, uri)
+      for (const [prefix, decl] of declByPrefix) {
+        const canonical = CANONICAL_PREFIX_BY_URI.get(decl.value)
+        if (canonical !== undefined && canonical !== prefix) continue
+        scope.bind(prefix, decl.value, prefix)
+        scope.bindOut(prefix, decl.value)
       }
-      for (const [prefix, uri] of newBindings) {
+      for (const [prefix, decl] of declByPrefix) {
+        const uri = decl.value
         const canonical = CANONICAL_PREFIX_BY_URI.get(uri)
         if (canonical === undefined || canonical === prefix) continue
-        const bound = lookup(outBindings, canonical)
+        const bound = scope.outUri(canonical)
         if (bound !== undefined && bound !== uri) {
-          newOut.set(prefix, uri) // canonical prefix taken by another namespace: keep as-is
+          // canonical prefix taken by another namespace: keep as-is, unless a
+          // rename on this element already took this name
+          const taken = prefix !== '' && renamedHere.has(prefix)
+          const out = taken ? freshPrefix(prefix) : prefix
+          if (taken) decl.name = `xmlns:${out}`
+          scope.bind(prefix, uri, out)
+          scope.bindOut(out, uri)
           continue
         }
-        newRenames.set(prefix, canonical)
+        scope.bind(prefix, uri, canonical)
         // by captured reference: finding by name could hit a declaration whose
         // name an earlier rename already rewrote to this prefix
-        const decl = declByPrefix.get(prefix)!
         if (bound === uri) {
           if (prefix !== '') drop.add(decl) // canonical binding already exists
-        } else if (prefix === '') {
-          inject.push({ name: `xmlns:${canonical}`, value: uri }) // keep xmlns= for other content
         } else {
-          decl.name = `xmlns:${canonical}`
+          if (prefix === '') {
+            inject.push({ name: `xmlns:${canonical}`, value: uri }) // keep xmlns= for other content
+          } else {
+            decl.name = `xmlns:${canonical}`
+          }
+          scope.bindOut(canonical, uri)
+          renamedHere.add(canonical)
         }
-        newOut.set(canonical, uri)
-        if (prefix === '') newOut.set('', uri)
+        if (prefix === '') scope.bindOut('', uri)
       }
       if (drop.size > 0 || inject.length > 0) {
         attrs.splice(0, attrs.length, ...attrs.filter((a) => !drop.has(a)), ...inject)
       }
     }
 
+    // A reference whose output prefix a declaration between its binding and here
+    // rebinds to another namespace (<x xmlns:w="urn:other"> under a renamed
+    // ns0:) gets a declaration on this element: its own prefix when that is free
+    // here, a fresh one otherwise.
+    const resolve = (source: string): string => {
+      const b = scope.top(source)
+      if (!b || b.uri === '') return source
+      if (scope.outUri(b.out) === b.uri) return b.out
+      if (source === '' && scope.outUri('') === b.uri) {
+        scope.bind('', b.uri, '') // the default namespace still covers it
+        return ''
+      }
+      const next =
+        source === '' || (scope.outUri(source) ?? b.uri) !== b.uri ? freshPrefix(source) : source
+      if (scope.outUri(next) !== b.uri) {
+        attrs.push({ name: `xmlns:${next}`, value: b.uri })
+        scope.bindOut(next, b.uri)
+      }
+      scope.bind(source, b.uri, next)
+      return next
+    }
+
     const [prefix, local] = splitQName(name)
-    const elementUri = lookup(bindings, prefix)
+    const elementUri = scope.top(prefix)?.uri
 
     // Word 2013 strict writes wordprocessingShape children in the wp (drawing)
     // namespace inside <a:graphicData uri="...wordprocessingShape">; the engine
     // matches wps:*, so shift those elements (only there) into the wps prefix.
-    let targetPrefix = renamePrefix(prefix)
+    let targetPrefix: string
     if (wspDepth > 0 && elementUri === WP_URI) {
       targetPrefix = 'wps'
-      if (lookup(outBindings, 'wps') !== WPS_URI) {
+      if (scope.outUri('wps') !== WPS_URI) {
         attrs.push({ name: 'xmlns:wps', value: WPS_URI })
-        if (!scoped) {
-          scoped = true
-          bindings.push(new Map())
-          renames.push(new Map())
-          outBindings.push(new Map())
-        }
-        outBindings[outBindings.length - 1]!.set('wps', WPS_URI)
+        scope.bindOut('wps', WPS_URI)
       }
+    } else {
+      targetPrefix = resolve(prefix)
     }
     const newName = targetPrefix === '' ? local : `${targetPrefix}:${local}`
 
@@ -388,24 +534,37 @@ export function normalizeOoxmlXml(xml: string): string {
       }
       const [ap, al] = splitQName(attr.name)
       if (inWNs && local === 'document' && al === 'conformance') continue
+      const attrUri = ap === '' ? undefined : scope.top(ap)?.uri
       if (ap !== '' && ap !== 'xml') {
-        const np = renamePrefix(ap)
+        const np = resolve(ap)
         if (np !== ap) attr.name = `${np}:${al}`
       }
       // MCE prefix lists must keep referring to the renamed prefixes
       const mceList =
-        (al === 'Ignorable' || al === 'MustUnderstand') && lookup(bindings, ap) === MC_URI
+        (al === 'Ignorable' || al === 'MustUnderstand') && attrUri === MC_URI
           ? true
           : al === 'Requires' && ap === '' && elementUri === MC_URI
+      // ...and so must the qualified-name lists ("w14:*", "v:shape")
+      const mceQNames =
+        (al === 'ProcessContent' || al === 'PreserveElements' || al === 'PreserveAttributes') &&
+        attrUri === MC_URI
       if (mceList) {
         attr.value = attr.value
           .split(/\s+/)
-          .map((p) => renamePrefix(p))
+          .map((p) => (p ? resolve(p) : p))
+          .join(' ')
+      } else if (mceQNames) {
+        attr.value = attr.value
+          .split(/\s+/)
+          .map((q) => {
+            const i = q.indexOf(':')
+            return i < 0 ? q : `${resolve(q.slice(0, i))}${q.slice(i)}`
+          })
           .join(' ')
       } else {
         attr.value = mapUriValue(attr.value)
         const factor = factors?.[al]
-        if (factor !== undefined && (ap === '' || lookup(bindings, ap) === W_URI)) {
+        if (factor !== undefined && (ap === '' || attrUri === W_URI)) {
           attr.value = convertMeasure(attr.value, factor)
         }
       }
@@ -421,15 +580,8 @@ export function normalizeOoxmlXml(xml: string): string {
         : false
     if (wspScope) wspDepth += 1
 
-    if (selfClosing) {
-      if (scoped) {
-        bindings.pop()
-        renames.pop()
-        outBindings.pop()
-      }
-    } else {
-      frames.push({ name: newName, scoped, wspScope })
-    }
+    if (selfClosing) scope.close()
+    else frames.push({ name: newName, wspScope })
   }
   out += xml.slice(cursor)
   return out

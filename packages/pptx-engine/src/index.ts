@@ -7,6 +7,7 @@
 import { stripRedactExt, syncRedactExt } from './redaction-xml'
 import JSZip from 'jszip'
 import { PackageArchive, relsPathFor, resolveTarget, type Relationship } from './zip'
+import { declareGeneratedPrefixes } from './ns-prefixes'
 import { parseClrMap, parseTheme, type Theme } from './theme'
 import {
   parseSlide,
@@ -777,6 +778,8 @@ export function commitSaved(opened: OpenedPptx): void {
       delete el.dirtyPPr
     }
     slide.originalXml = xml
+    // the head as just written (patchSlideXml declared a:/r:/p: on a dirty slide's root)
+    slide.bodyPrefix = declareGeneratedPrefixes(slide.bodyPrefix)
     delete slide.structureDirty
     archive.entries.set(slide.path, Buffer.from(xml, 'utf8'))
   }
@@ -823,11 +826,20 @@ function buildZip(opened: OpenedPptx): JSZip {
 }
 
 /**
+ * The slide's head as written on save: a rewritten slide's root also declares
+ * a:/r:/p:, which the generated fragments use undeclared (a slide that declares
+ * DrawingML only locally, as lxml writes it, would leave them unbound).
+ */
+function slideBodyPrefix(slide: Slide): string {
+  return slideIsDirty(slide) ? declareGeneratedPrefixes(slide.bodyPrefix) : slide.bodyPrefix
+}
+
+/**
  * Rebuild one slideN.xml: dirty elements are patch-regenerated, the rest pass
  * through as original bytes. With no dirty elements the result == originalXml.
  */
 export function patchSlideXml(slide: Slide): string {
-  const parts: string[] = [slide.bodyPrefix]
+  const parts: string[] = [slideBodyPrefix(slide)]
   for (const el of slide.elements) {
     parts.push(patchedElementXml(el))
     if (el.anchor.gapAfter) parts.push(el.anchor.gapAfter)

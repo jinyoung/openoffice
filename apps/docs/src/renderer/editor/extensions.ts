@@ -1121,6 +1121,34 @@ export const DocRuby = Node.create({
  * Inline picture in a table cell (document content: sizes stay in px, no theme
  * tokens). `xml` is the exact <w:drawing> fragment that saves verbatim.
  */
+/**
+ * How far a positionH="page" overlay picture's origin sits from the paper's
+ * left edge, as CSS: one left margin, plus the shift of a column-translated
+ * block (--doc-col-undo, styles.css), like the [data-page-rel-x] boxes. In a
+ * table cell a layoutInCell picture positions from the cell instead (Word):
+ * styles.css zeroes --doc-img-cell-origin there. layoutInCell="0" keeps the
+ * page origin.
+ */
+export function pagePictureOriginCss(drawingXml: unknown): string {
+  const page = 'calc(var(--doc-margin-left,0px) + var(--doc-col-undo,0px))'
+  return /layoutInCell\s*=\s*["'](?:0|false)["']/.test(String(drawingXml ?? ''))
+    ? page
+    : `var(--doc-img-cell-origin, ${page})`
+}
+
+/**
+ * Resize preview: a box offset moved by the handle shift. Plain px stays px; a
+ * computed offset (calc/min/max: page-relative anchors measure from the paper
+ * edge) is wrapped in calc(); anything else (none, %, keywords) gives null.
+ */
+export function shiftedOffsetCss(start: string, shift: number): string | null {
+  if (/^-?\d+(?:\.\d+)?px$/.test(start)) return `${parseFloat(start) + shift}px`
+  if (/^(?:calc|min|max|clamp)\(/.test(start)) {
+    return shift === 0 ? start : `calc(${start} + ${shift}px)`
+  }
+  return null
+}
+
 export const DocInlineImage = Node.create({
   name: 'docInlineImage',
   inline: true,
@@ -1218,9 +1246,19 @@ export const DocInlineImage = Node.create({
       // page-relative Y in content-area coordinates; pagination re-pins it on the anchor's page
       const dy =
         relV === 'page' ? `calc(${px(top - ty)} - var(--doc-margin-top,0px))` : px(top - ty)
+      // positionH page: the offset measures from the paper edge, one left margin
+      // before the column (a full-page cover picture at x=0 otherwise lands a margin
+      // to the right, over the cover text). Only CSS knows the origin, so min/max
+      // split the content-area X the same way: negative in left, positive in transform.
+      const fromPaperX =
+        node.attrs.relH === 'page'
+          ? `calc(${px(left)} - ${pagePictureOriginCss(node.attrs.xml)})`
+          : null
+      const leftCss = fromPaperX ? `min(0px, ${fromPaperX})` : px(lx)
+      const dx = fromPaperX ? `max(0px, ${fromPaperX})` : px(left - lx)
       styles.push(
-        `position:absolute;left:${px(lx)};top:${px(ty)}`,
-        `transform:translate(${px(left - lx)}, ${dy})${xf.length ? ` ${xf.join(' ')}` : ''}`,
+        `position:absolute;left:${leftCss};top:${px(ty)}`,
+        `transform:translate(${dx}, ${dy})${xf.length ? ` ${xf.join(' ')}` : ''}`,
         'max-width:none',
       )
       attrs.style = styles.join(';')
@@ -4924,7 +4962,10 @@ function protectedDomSpec(node: PmNode): DomSpec {
       } else if (posH === 'right') {
         imgFloatPos = `right:0;top:${topCss}${imgZIndexCss}`
       } else {
-        imgFloatPos = `left:${tx.toFixed(1)}px;top:${topCss}${imgZIndexCss}`
+        const leftCss = pageRelH
+          ? `calc(${tx.toFixed(1)}px - ${pagePictureOriginCss(node.attrs.xml)})`
+          : `${tx.toFixed(1)}px`
+        imgFloatPos = `left:${leftCss};top:${topCss}${imgZIndexCss}`
       }
     } else if (banded) {
       const tx = Number(node.attrs.imageOffsetXEmu) / EMU_PER_PX
@@ -6091,12 +6132,8 @@ function imageResizePlugin(): Plugin {
           const startImgH = parseFloat(img.style.height) || img.offsetHeight || startH
           const startImgLeft = parseFloat(img.style.left) || 0
           const startImgTop = parseFloat(img.style.top) || 0
-          const pxLeft = /^-?\d+(?:\.\d+)?px$/.test(imageBox.style.left)
-            ? parseFloat(imageBox.style.left)
-            : null
-          const pxTop = /^-?\d+(?:\.\d+)?px$/.test(imageBox.style.top)
-            ? parseFloat(imageBox.style.top)
-            : null
+          const startLeft = imageBox.style.left
+          const startTop = imageBox.style.top
           const shiftsInFlow = imageBox.style.position !== 'absolute'
           const startX = event.clientX
           const startY = event.clientY
@@ -6145,9 +6182,11 @@ function imageResizePlugin(): Plugin {
             const { w, h, shiftX, shiftY } = geometryAt(e)
             imageBox.style.width = `${w}px`
             imageBox.style.height = `${h}px`
-            if (pxLeft !== null) imageBox.style.left = `${pxLeft + shiftX}px`
+            const left = shiftedOffsetCss(startLeft, shiftX)
+            if (left !== null) imageBox.style.left = left
             else if (west && shiftsInFlow) imageBox.style.left = `${shiftX}px`
-            if (pxTop !== null) imageBox.style.top = `${pxTop + shiftY}px`
+            const top = shiftedOffsetCss(startTop, shiftY)
+            if (top !== null) imageBox.style.top = top
             else if (north && shiftsInFlow) imageBox.style.top = `${shiftY}px`
             if (cropped) {
               const sx = w / startW

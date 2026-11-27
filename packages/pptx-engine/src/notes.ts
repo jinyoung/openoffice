@@ -11,6 +11,7 @@
  */
 import type { OpenedPptx } from './index'
 import { relsPathFor, resolveTarget, type PackageArchive } from './zip'
+import { declareGeneratedPrefixes } from './ns-prefixes'
 import {
   decodeNumericCharRefs,
   escapeXmlText,
@@ -128,7 +129,9 @@ export function setSlideNotes(opened: OpenedPptx, slideIndex: number, text: stri
   } else {
     next = xml.replace('</p:spTree>', () => `${NOTES_BODY_SP_OPEN}${txBody}</p:sp></p:spTree>`)
   }
-  setEntry(archive, notesPath, next)
+  // the fresh txBody writes a:/p: undeclared; a notes part declaring them only
+  // locally (lxml) gets them on its root
+  setEntry(archive, notesPath, declareGeneratedPrefixes(next))
   return true
 }
 

@@ -10,6 +10,7 @@
  */
 import type { PackageArchive } from './zip'
 import { relsPathFor, resolveTarget } from './zip'
+import { declareGeneratedPrefixes } from './ns-prefixes'
 import { hasContentTypeOverride, maxRelationshipIdNumber } from './xml-utils'
 import type { SlideSize } from './types'
 import {
@@ -233,6 +234,7 @@ export function ensureBuiltinLayout(
   const nextMaster = masterXml.includes('</p:sldLayoutIdLst>')
     ? masterXml.replace('</p:sldLayoutIdLst>', () => `${idTag}</p:sldLayoutIdLst>`)
     : masterXml.replace(/(<p:clrMap\b[^>]*\/>)/, `$1<p:sldLayoutIdLst>${idTag}</p:sldLayoutIdLst>`)
-  archive.entries.set(masterPath, Buffer.from(nextMaster, 'utf8'))
+  // the new <p:sldLayoutId r:id> needs r: bound on the master's root
+  archive.entries.set(masterPath, Buffer.from(declareGeneratedPrefixes(nextMaster), 'utf8'))
   return layoutPath
 }

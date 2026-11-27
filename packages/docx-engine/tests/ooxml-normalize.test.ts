@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { needsOoxmlNormalization, normalizeOoxmlXml } from '../src/ooxml-normalize'
 import { loadDocxZip } from '../src/zip-load'
 import { parseDocx } from '../src/index'
+import { buildDocx } from './helpers/build-docx'
 
 const XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
 const W_TRANS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -252,5 +253,76 @@ describe('parseDocx over normalized packages', () => {
     const normalized = await zip.file('word/document.xml')!.async('string')
     expect(normalized).toContain('<w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/>')
     expect(normalized).not.toContain('conformance')
+  })
+})
+
+describe('story parts re-serialized with their own prefixes', () => {
+  // lxml writing back one story part spells WordprocessingML as ns0: there while
+  // document.xml stays canonical: that story used to come back empty
+  const W = W_TRANS
+  const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+  const CT = 'application/vnd.openxmlformats-officedocument.wordprocessingml'
+  const story = (root: string, inner: string) =>
+    `${XML_DECL}<ns0:${root} xmlns:ns0="${W}">${inner}</ns0:${root}>`
+  const para = (text: string) => `<ns0:p><ns0:r><ns0:t>${text}</ns0:t></ns0:r></ns0:p>`
+
+  it('normalizes a header found by its relationship type, whatever its part name', async () => {
+    const bytes = await buildDocx({
+      bodyXml: '<w:p><w:r><w:t>Body</w:t></w:r></w:p>',
+      extraParts: [
+        {
+          path: 'word/hdrA.xml',
+          xml: story('hdr', para('Header text')),
+          contentType: `${CT}.header+xml`,
+        },
+      ],
+      extraRels: `<Relationship Id="rId50" Type="${REL}/header" Target="hdrA.xml"/>`,
+      sectPrExtra: '<w:headerReference w:type="default" r:id="rId50"/>',
+    })
+    expect((await parseDocx(bytes)).headerText).toBe('Header text')
+  })
+
+  it('normalizes a footer', async () => {
+    const bytes = await buildDocx({
+      bodyXml: '<w:p><w:r><w:t>Body</w:t></w:r></w:p>',
+      extraParts: [
+        {
+          path: 'word/footer1.xml',
+          xml: story('ftr', para('Footer text')),
+          contentType: `${CT}.footer+xml`,
+        },
+      ],
+      extraRels: `<Relationship Id="rId51" Type="${REL}/footer" Target="footer1.xml"/>`,
+      sectPrExtra: '<w:footerReference w:type="default" r:id="rId51"/>',
+    })
+    expect((await parseDocx(bytes)).footerText).toBe('Footer text')
+  })
+
+  it('normalizes footnotes', async () => {
+    const note =
+      '<ns0:footnote ns0:id="2"><ns0:p><ns0:r><ns0:footnoteRef/></ns0:r>' +
+      '<ns0:r><ns0:t>A note</ns0:t></ns0:r></ns0:p></ns0:footnote>'
+    const bytes = await buildDocx({
+      bodyXml: '<w:p><w:r><w:t>Body</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p>',
+      extraParts: [
+        {
+          path: 'word/footnotes.xml',
+          xml: story('footnotes', note),
+          contentType: `${CT}.footnotes+xml`,
+        },
+      ],
+      extraRels: `<Relationship Id="rId52" Type="${REL}/footnotes" Target="footnotes.xml"/>`,
+    })
+    expect((await parseDocx(bytes)).footnotes.map((n) => n.text)).toEqual(['A note'])
+  })
+
+  it('leaves a canonical package alone when a strict URI only appears in text', async () => {
+    const documentXml =
+      `${XML_DECL}<w:document xmlns:w="${W}"><w:body>` +
+      `<w:p><w:r><w:rPr><w:b w:val='1'/></w:rPr><w:t>See ${W_STRICT}</w:t></w:r></w:p>` +
+      `<!-- xmlns:w="${W_STRICT}" --></w:body></w:document>`
+    expect(needsOoxmlNormalization(documentXml)).toBe(false)
+    const zip = await loadDocxZip(await buildDocxBytes(documentXml))
+    expect(await zip.file('word/document.xml')!.async('string')).toBe(documentXml)
   })
 })
