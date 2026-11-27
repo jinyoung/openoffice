@@ -80,7 +80,9 @@ const theme = EditorView.theme({
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--text)' },
   '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground':
     { backgroundColor: 'var(--accent-soft)' },
-  '.cm-activeLine': { backgroundColor: 'var(--hover)' },
+  // drawSelection() paints the selection behind the text, so the caret's line must stay see-through: an opaque
+  // colour here hid a selection on that line (Shift+Arrow, Shift+End) — it was made but could not be seen
+  '.cm-activeLine': { backgroundColor: 'rgba(127, 127, 127, 0.08)' },
   '.cm-gutters': {
     backgroundColor: 'var(--surface)',
     color: 'var(--text-muted)',
