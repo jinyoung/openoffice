@@ -603,6 +603,8 @@ export function hoistPaperClamp(dy: number, topPx: number, boxOffsets: number[])
 export function hoistSlotOf(f: { el: HTMLElement }): 'left' | 'center' | 'right' | null {
   const st = f.el.getAttribute('style') ?? ''
   if (/(?:^|;)\s*left:\s*-?[\d.]+px/.test(st)) return 'left'
+  // a page-relative X computes its offset from the paper edge in CSS
+  if (/(?:^|;)\s*left:\s*(?:calc|min|max)\(/.test(st)) return 'left'
   if (/(?:^|;)\s*left:\s*50%/.test(st)) return 'center'
   if (/(?:^|;)\s*right:\s*0(?:px)?\s*(?:;|$)/.test(st)) return 'right'
   return null

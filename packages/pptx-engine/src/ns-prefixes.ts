@@ -233,6 +233,19 @@ export function canonicalizePrefixes(xml: string): string {
   if (!needsPrefixCanonicalization(xml)) return xml
 
   const scope = new Scope()
+  /** last number handed out per base of a fresh prefix ('ns' for the default namespace) */
+  const fresh = new Map<string, number>()
+  /** an output prefix unbound here; one counter per base only climbs, so no
+   *  search restarts from the first name */
+  const freshPrefix = (source: string): string => {
+    const base = source || 'ns'
+    let k = fresh.get(base) ?? 0
+    let next: string
+    do next = `${base}-${++k}`
+    while (scope.outUri(next) !== undefined)
+    fresh.set(base, k)
+    return next
+  }
   const frames: Array<{ name: string; outName: string }> = []
   let out = ''
   let cursor = 0
@@ -286,10 +299,17 @@ export function canonicalizePrefixes(xml: string): string {
       const here = declared.get(canonical)
       const current = here ?? scope.outUri(canonical)
       if (current !== undefined && current !== uri) {
-        // the canonical prefix means another namespace here: keep this one as written
-        scope.bind(prefix, uri, prefix)
-        scope.bindOut(prefix, uri)
-        declared.set(prefix, uri)
+        // the canonical prefix means another namespace here: keep this one as
+        // written, unless a rename on this element already took its name
+        const taken = prefix !== '' && (declared.get(prefix) ?? uri) !== uri
+        const out = taken ? freshPrefix(prefix) : prefix
+        if (taken) {
+          attr.name = `xmlns:${out}`
+          changed = true
+        }
+        scope.bind(prefix, uri, out)
+        scope.bindOut(out, uri)
+        declared.set(out, uri)
         continue
       }
       scope.bind(prefix, uri, canonical)
@@ -327,12 +347,8 @@ export function canonicalizePrefixes(xml: string): string {
         changed = true
         return ''
       }
-      let next = prefix
-      if (prefix === '' || (scope.outUri(prefix) ?? b.uri) !== b.uri) {
-        let k = 1
-        do next = `${prefix || 'ns'}-${k++}`
-        while (scope.outUri(next) !== undefined)
-      }
+      const next =
+        prefix === '' || (scope.outUri(prefix) ?? b.uri) !== b.uri ? freshPrefix(prefix) : prefix
       if (scope.outUri(next) !== b.uri) {
         attrs.push({ name: `xmlns:${next}`, value: b.uri })
         scope.bindOut(next, b.uri)

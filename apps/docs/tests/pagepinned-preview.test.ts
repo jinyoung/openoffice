@@ -110,6 +110,22 @@ describe('hoistSlotOf', () => {
     expect(hoistSlotOf(box('position:absolute;right:0px;top:2px'))).toBe('right')
     expect(hoistSlotOf(box('position:absolute;right:20px;top:2px'))).toBeNull()
   })
+
+  // a standalone page-positioned behind-text picture measures X from the paper
+  // edge in CSS; skipped, it was cut at its page's flow end instead of re-pinned
+  it('classifies a computed left offset as the left slot', () => {
+    expect(
+      hoistSlotOf(
+        box(
+          'position:absolute;left:calc(46.7px - var(--doc-img-cell-origin, calc(var(--doc-margin-left,0px) + var(--doc-col-undo,0px))));top:calc(2.5px - var(--doc-margin-top,0px))',
+        ),
+      ),
+    ).toBe('left')
+    expect(hoistSlotOf(box('position:absolute;left:min(0px, calc(3px - var(--x)));top:0'))).toBe(
+      'left',
+    )
+    expect(hoistSlotOf(box('position:absolute;left:max(0px, 4px);top:0'))).toBe('left')
+  })
 })
 
 describe('hoistPaperClamp', () => {

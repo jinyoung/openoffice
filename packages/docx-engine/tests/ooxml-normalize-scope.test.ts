@@ -83,6 +83,38 @@ describe('normalizeOoxmlXml under nested declarations', () => {
     expect(out).toContain('mc:PreserveAttributes="w14:k"')
   })
 
+  it('gives fresh prefixes from a climbing counter (20,000 siblings)', () => {
+    // r: is WordprocessingML here and renamed to w:; each sibling rebinds w: and
+    // the name r: is the relationships namespace in the output, so every <r:t/>
+    // needs a fresh prefix
+    const doc = (siblings: number) =>
+      `<r:document xmlns:r="${W}" xmlns:ns9="${R}">` +
+      '<x xmlns:w="urn:other"><r:t/><ns9:k/></x>'.repeat(siblings) +
+      '</r:document>'
+    const started = performance.now()
+    const out = normalizeOoxmlXml(doc(20_000))
+    expect(performance.now() - started).toBeLessThan(1000)
+    expect(out.match(/<r-\d+:t xmlns:r-\d+=/g)).toHaveLength(20_000)
+    const small = doc(50)
+    expect(expandedNames(normalizeOoxmlXml(small))).toEqual(expandedNames(small))
+  })
+
+  it('never declares one prefix twice on an element', () => {
+    // ns0: takes w: by rename; w: itself (relationships, whose canonical r: is
+    // taken by another namespace here) then has to move aside
+    for (const decls of [
+      `xmlns:ns0="${W}" xmlns:w="${R}" xmlns:r="urn:other"`,
+      `xmlns:w="${R}" xmlns:r="urn:other" xmlns:ns0="${W}"`,
+    ]) {
+      const xml = `<root ${decls}><ns0:p/><w:id/><r:own/></root>`
+      const out = normalizeOoxmlXml(xml)
+      const root = out.slice(0, out.indexOf('>') + 1)
+      const names = [...root.matchAll(/\s(xmlns:[^=\s]+)=/g)].map((m) => m[1])
+      expect(new Set(names).size).toBe(names.length)
+      expect(expandedNames(out)).toEqual(expandedNames(xml))
+    }
+  })
+
   it('stays linear on deep nesting', () => {
     // a declaration on each of 60,000 levels: the old frame-by-frame lookup was quadratic
     const depth = 60_000

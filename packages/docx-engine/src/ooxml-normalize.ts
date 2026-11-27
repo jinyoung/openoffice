@@ -340,6 +340,19 @@ function splitQName(name: string): [prefix: string, local: string] {
 
 export function normalizeOoxmlXml(xml: string): string {
   const scope = new NsScope()
+  /** last number handed out per base of a fresh prefix ('ns' for the default namespace) */
+  const fresh = new Map<string, number>()
+  /** an output prefix unbound here; one counter per base only climbs, so no
+   *  search restarts from the first name */
+  const freshPrefix = (source: string): string => {
+    const base = source || 'ns'
+    let k = fresh.get(base) ?? 0
+    let next: string
+    do next = `${base}-${++k}`
+    while (scope.outUri(next) !== undefined)
+    fresh.set(base, k)
+    return next
+  }
   const frames: Frame[] = []
   let wspDepth = 0
 
@@ -424,6 +437,8 @@ export function normalizeOoxmlXml(xml: string): string {
     if (declByPrefix.size > 0) {
       const drop = new Set<Attr>()
       const inject: Attr[] = []
+      /** output prefixes a rename or injection declared on this element */
+      const renamedHere = new Set<string>()
       // declarations that keep their prefix claim it in the output first, so a
       // rename can neither steal it nor be blocked by a prefix that is itself
       // being renamed away
@@ -439,9 +454,13 @@ export function normalizeOoxmlXml(xml: string): string {
         if (canonical === undefined || canonical === prefix) continue
         const bound = scope.outUri(canonical)
         if (bound !== undefined && bound !== uri) {
-          // canonical prefix taken by another namespace: keep as-is
-          scope.bind(prefix, uri, prefix)
-          scope.bindOut(prefix, uri)
+          // canonical prefix taken by another namespace: keep as-is, unless a
+          // rename on this element already took this name
+          const taken = prefix !== '' && renamedHere.has(prefix)
+          const out = taken ? freshPrefix(prefix) : prefix
+          if (taken) decl.name = `xmlns:${out}`
+          scope.bind(prefix, uri, out)
+          scope.bindOut(out, uri)
           continue
         }
         scope.bind(prefix, uri, canonical)
@@ -456,6 +475,7 @@ export function normalizeOoxmlXml(xml: string): string {
             decl.name = `xmlns:${canonical}`
           }
           scope.bindOut(canonical, uri)
+          renamedHere.add(canonical)
         }
         if (prefix === '') scope.bindOut('', uri)
       }
@@ -476,12 +496,8 @@ export function normalizeOoxmlXml(xml: string): string {
         scope.bind('', b.uri, '') // the default namespace still covers it
         return ''
       }
-      let next = source
-      if (source === '' || (scope.outUri(source) ?? b.uri) !== b.uri) {
-        let k = 1
-        do next = `${source || 'ns'}-${k++}`
-        while (scope.outUri(next) !== undefined)
-      }
+      const next =
+        source === '' || (scope.outUri(source) ?? b.uri) !== b.uri ? freshPrefix(source) : source
       if (scope.outUri(next) !== b.uri) {
         attrs.push({ name: `xmlns:${next}`, value: b.uri })
         scope.bindOut(next, b.uri)

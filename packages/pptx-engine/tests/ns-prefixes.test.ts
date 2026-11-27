@@ -18,15 +18,19 @@
 import { describe, it, expect } from 'vitest'
 import JSZip from 'jszip'
 import {
+  addElement,
   copyElementData,
   copySlide,
   createBlankPptx,
+  ensureBuiltinLayout,
   openPptx,
+  parseMasterPart,
   pasteElements,
   pasteSlide,
   patchSlideXml,
   savePptx,
 } from '../src/index'
+import { notesPathForSlide, setSlideNotes } from '../src/notes'
 import {
   canonicalizePrefixes,
   declareGeneratedPrefixes,
@@ -243,6 +247,39 @@ describe('canonicalizePrefixes', () => {
     expectSameXml(mixed, out)
   })
 
+  it('gives fresh prefixes from a climbing counter (20,000 siblings)', () => {
+    // p: is DrawingML here and renamed to a:; each sibling rebinds a: and the
+    // name p: is PresentationML in the output, so every <p:t/> needs a fresh prefix
+    const doc = (siblings: number) =>
+      `<p:r xmlns:p="${A}" xmlns:ns9="${P}">` +
+      '<x xmlns:a="urn:other"><p:t/><ns9:k/></x>'.repeat(siblings) +
+      '</p:r>'
+    const big = doc(20_000)
+    const started = performance.now()
+    const out = canonicalizePrefixes(big)
+    expect(performance.now() - started).toBeLessThan(1000)
+    expect(out.match(/<p-\d+:t xmlns:p-\d+=/g)).toHaveLength(20_000)
+    // the namespace-aware comparison on a sample (DOM parsing 20,000 elements is the slow part)
+    const small = doc(50)
+    expectSameXml(small, canonicalizePrefixes(small))
+  })
+
+  it('never declares one prefix twice on an element', () => {
+    // ns0: takes a: by rename; a: itself (PresentationML, whose canonical p: is
+    // taken by another namespace here) then has to move aside
+    for (const decls of [
+      `xmlns:ns0="${A}" xmlns:a="${P}" xmlns:p="urn:other"`,
+      `xmlns:a="${P}" xmlns:p="urn:other" xmlns:ns0="${A}"`,
+    ]) {
+      const xml = `<root ${decls}><ns0:t/><a:sld/><p:own/></root>`
+      const out = canonicalizePrefixes(xml)
+      const root = out.slice(0, out.indexOf('>') + 1)
+      const names = [...root.matchAll(/\s(xmlns:[^=\s]+)=/g)].map((m) => m[1])
+      expect(new Set(names).size).toBe(names.length)
+      expectSameXml(xml, out)
+    }
+  })
+
   it('stays linear on deep nesting', () => {
     // a declaration on each of 60,000 levels: the old frame-by-frame lookup took 12 s
     const depth = 60_000
@@ -363,5 +400,60 @@ describe('a slide declaring DrawingML only locally, on conventional prefixes', (
     )
     const reopened = await openPptx(await savePptx(opened))
     expect(textOf(firstText(reopened.deck.slides[0]!.elements))[0]).toBe('Kicker line added')
+  })
+})
+
+describe('masters, layouts and notes declaring DrawingML only locally', () => {
+  /** a part with a:/r: dropped from its root and declared on each element instead (lxml-like) */
+  const localOnly = (xml: string) =>
+    xml
+      .replace(` xmlns:a="${A}"`, '')
+      .replace(` xmlns:r="${R}"`, '')
+      .replace(/<a:(\w+)/g, `<a:$1 xmlns:a="${A}"`)
+      .replace(/<(p:\w+)((?:\s[^>]*?)?\sr:\w+=)/g, `<$1 xmlns:r="${R}"$2`)
+
+  async function localOnlyDeck(): Promise<Uint8Array> {
+    const zip = await JSZip.loadAsync(await createBlankPptx())
+    for (const path of [MASTER, LAYOUT]) {
+      const xml = localOnly(await zip.file(path)!.async('string'))
+      parseStrictly(xml)
+      expect(xml.slice(0, xml.indexOf('<p:cSld'))).not.toContain('xmlns:a=')
+      zip.file(path, xml)
+    }
+    return zip.generateAsync({ type: 'uint8array' })
+  }
+
+  it('a master edit writes the generated declarations on its root', async () => {
+    const opened = await openPptx(await localOnlyDeck())
+    const master = parseMasterPart(opened.archive, MASTER)!
+    addElement(master, {
+      kind: 'textbox',
+      offset: { x: 0, y: 0, cx: 914400, cy: 457200 },
+      paragraphs: [{ runs: [{ text: 'Master note' }] }],
+    })
+    const doc = parseStrictly(patchSlideXml(master))
+    expect(Array.from(doc.getElementsByTagNameNS(A, 't')).map((t) => t.textContent)).toContain(
+      'Master note',
+    )
+  })
+
+  it('a layout registered on such a master keeps the master namespace-valid', async () => {
+    const opened = await openPptx(await localOnlyDeck())
+    expect(ensureBuiltinLayout(opened.archive, opened.deck.size, 'titleContent')).not.toBeNull()
+    const master = Buffer.from(opened.archive.entries.get(MASTER)!).toString('utf8')
+    expect(parseStrictly(master).getElementsByTagNameNS(P, 'sldLayoutId').length).toBe(2)
+  })
+
+  it('rewritten speaker notes stay namespace-valid', async () => {
+    const opened = await openPptx(await createBlankPptx())
+    expect(setSlideNotes(opened, 0, 'first')).toBe(true)
+    const notesPath = notesPathForSlide(opened.archive, opened.deck.slides[0]!.path)!
+    const notes = Buffer.from(opened.archive.entries.get(notesPath)!).toString('utf8')
+    opened.archive.entries.set(notesPath, Buffer.from(localOnly(notes), 'utf8'))
+    expect(setSlideNotes(opened, 0, 'second line')).toBe(true)
+    const doc = parseStrictly(Buffer.from(opened.archive.entries.get(notesPath)!).toString('utf8'))
+    expect(Array.from(doc.getElementsByTagNameNS(A, 't')).map((t) => t.textContent)).toEqual([
+      'second line',
+    ])
   })
 })
